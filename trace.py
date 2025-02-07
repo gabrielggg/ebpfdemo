@@ -1,93 +1,146 @@
+#!/usr/bin/python
+from __future__ import print_function
 from bcc import BPF
+from bcc.utils import printb
+import ctypes
 
-bpf_code = """
+# eBPF program with HTTP body capture
+bpf_text = """
 #include <uapi/linux/ptrace.h>
-#include <linux/sched.h>
+#include <net/sock.h>
+#include <bcc/proto.h>
 
-#define MAX_BUF_SIZE 256  // Reduced from 1024 to stay within stack limit
+#define MAX_BODY_SIZE 256
 
-struct data_t {
+// Structure for connection events
+struct conn_event_t {
     u32 pid;
-    int type;    // 0=send, 1=recv
-    int fd;
-    size_t len;  // Original buffer length
-    int flags;
+    u32 saddr;
+    u32 daddr;
+    u16 dport;
     char comm[TASK_COMM_LEN];
-    char buffer[MAX_BUF_SIZE];
-    u32 buffer_len;  // Actual captured length
 };
 
-BPF_PERF_OUTPUT(events);
+// Structure for data events
+struct data_event_t {
+    u32 pid;
+    int fd;
+    u8 direction;  // 0=send, 1=recv
+    char buffer[MAX_BODY_SIZE];
+    u32 buffer_len;
+};
 
-// Helper to capture buffer data safely
-static void capture_buffer(struct pt_regs *ctx, void *buf_ptr, struct data_t *data) {
-    data->buffer_len = (data->len > MAX_BUF_SIZE) ? MAX_BUF_SIZE : data->len;
-    if (data->buffer_len > 0) {
-        bpf_probe_read_user(data->buffer, data->buffer_len, buf_ptr);
-    }
-}
+BPF_HASH(currsock, u32, struct sock *);
+BPF_PERF_OUTPUT(conn_events);
+BPF_PERF_OUTPUT(data_events);
 
-int trace_send(struct pt_regs *ctx) {
-    struct data_t data;
+// Store HTTP connections
+BPF_HASH(http_connections, u32, struct conn_event_t);
 
-    // Manually initialize fields (no memset!)
-    data.pid = bpf_get_current_pid_tgid() >> 32;
-    bpf_get_current_comm(&data.comm, sizeof(data.comm));
-    data.type = 0;
-    data.fd = PT_REGS_PARM1(ctx);    // sockfd
-    data.len = PT_REGS_PARM3(ctx);   // len
-    data.flags = PT_REGS_PARM4(ctx); // flags
-    data.buffer_len = 0;
-
-    void *buf = (void *)PT_REGS_PARM2(ctx);  // Buffer pointer
-    capture_buffer(ctx, buf, &data);
-    
-    events.perf_submit(ctx, &data, sizeof(data));
+int kprobe__tcp_v4_connect(struct pt_regs *ctx, struct sock *sk) {
+    u32 pid = bpf_get_current_pid_tgid();
+    currsock.update(&pid, &sk);
     return 0;
 }
 
-int trace_recv(struct pt_regs *ctx) {
-    struct data_t data;
+int kretprobe__tcp_v4_connect(struct pt_regs *ctx) {
+    u32 pid = bpf_get_current_pid_tgid();
+    struct sock **skpp = currsock.lookup(&pid);
+    if (!skpp) return 0;
 
-    // Manual initialization
-    data.pid = bpf_get_current_pid_tgid() >> 32;
-    bpf_get_current_comm(&data.comm, sizeof(data.comm));
-    data.type = 1;
-    data.fd = PT_REGS_PARM1(ctx);    // sockfd
-    data.len = PT_REGS_PARM3(ctx);   // len
-    data.flags = PT_REGS_PARM4(ctx); // flags
-    data.buffer_len = 0;
+    if (PT_REGS_RC(ctx) != 0) {
+        currsock.delete(&pid);
+        return 0;
+    }
 
-    void *buf = (void *)PT_REGS_PARM2(ctx);  // Buffer pointer
-    capture_buffer(ctx, buf, &data);
+    struct sock *skp = *skpp;
+    struct conn_event_t conn = {};
+    conn.pid = pid >> 32;
+    conn.saddr = skp->__sk_common.skc_rcv_saddr;
+    conn.daddr = skp->__sk_common.skc_daddr;
+    conn.dport = ntohs(skp->__sk_common.skc_dport);
+    bpf_get_current_comm(&conn.comm, sizeof(conn.comm));
     
-    events.perf_submit(ctx, &data, sizeof(data));
+    http_connections.update(&pid, &conn);
+    conn_events.perf_submit(ctx, &conn, sizeof(conn));
+    currsock.delete(&pid);
+    return 0;
+}
+
+// Capture send data
+int trace_send(struct pt_regs *ctx, int fd, void *buf, size_t len) {
+    struct data_event_t event = {};
+    event.pid = bpf_get_current_pid_tgid() >> 32;
+    event.fd = fd;
+    event.direction = 0;
+    event.buffer_len = len > MAX_BODY_SIZE ? MAX_BODY_SIZE : len;
+    bpf_get_current_comm(&event.buffer, sizeof(event.buffer));
+    bpf_probe_read_user(event.buffer, event.buffer_len, buf);
+    data_events.perf_submit(ctx, &event, sizeof(event));
+    return 0;
+}
+
+// Capture recv data
+int trace_recv(struct pt_regs *ctx, int fd, void *buf, size_t len) {
+    struct data_event_t event = {};
+    event.pid = bpf_get_current_pid_tgid() >> 32;
+    event.fd = fd;
+    event.direction = 1;
+    event.buffer_len = len > MAX_BODY_SIZE ? MAX_BODY_SIZE : len;
+    bpf_get_current_comm(&event.buffer, sizeof(event.buffer));
+    bpf_probe_read_user(event.buffer, event.buffer_len, buf);
+    data_events.perf_submit(ctx, &event, sizeof(event));
     return 0;
 }
 """
 
 # Load BPF program
-bpf = BPF(text=bpf_code)
+b = BPF(text=bpf_text)
 
-# Attach kprobes (same as before)
-send_fn = bpf.get_syscall_fnname("send")
-bpf.attach_kprobe(event=send_fn, fn_name="trace_send")
+# Attach kprobes for send/recv
+send_fn = b.get_syscall_fnname("send")
+b.attach_kprobe(event=send_fn, fn_name="trace_send")
 
-recv_fn = bpf.get_syscall_fnname("recv")
-bpf.attach_kprobe(event=recv_fn, fn_name="trace_recv")
+recv_fn = b.get_syscall_fnname("recv")
+b.attach_kprobe(event=recv_fn, fn_name="trace_recv")
 
-# Event printer (unchanged)
-def print_event(cpu, data, size):
-    event = bpf["events"].event(data)
-    action = "SEND" if event.type == 0 else "RECV"
-    buf = bytes(event.buffer[:event.buffer_len]).decode('utf-8', errors='replace')
-    print(f"PID: {event.pid:<6} COMM: {event.comm.decode():<12} TYPE: {action:<4} FD: {event.fd:<4} LEN: {event.len:<6} FLAGS: {event.flags}")
-    print(f"BODY: {buf[:120]} [...]\n")
+# Define event printers
+def print_conn_event(cpu, data, size):
+    event = b["conn_events"].event(data)
+    printb(b"%-6d %-12.12s %-16s %-16s %-4d" % (
+        event.pid,
+        event.comm,
+        inet_ntoa(event.saddr),
+        inet_ntoa(event.daddr),
+        event.dport
+    ))
 
-print("Tracing send/recv with HTTP snippets... Ctrl-C to exit.")
-bpf["events"].open_perf_buffer(print_event)
+def print_data_event(cpu, data, size):
+    event = b["data_events"].event(data)
+    direction = "SEND" if event.direction == 0 else "RECV"
+    body = bytes(event.buffer[:event.buffer_len]).decode('utf-8', errors='replace')
+    printb(b"%-6d %-12.12s %-4s FD:%-3d %.*s" % (
+        event.pid,
+        event.buffer,
+        direction.encode(),
+        event.fd,
+        min(event.buffer_len, 120),
+        body.encode()
+    ))
+
+# Helper function to convert IP addresses
+def inet_ntoa(addr):
+    return b'.'.join([str(addr >> i & 0xff).encode() for i in [0, 8, 16, 24][::-1]])
+
+# Print headers
+print("%-6s %-12s %-16s %-16s %-4s" % ("PID", "COMM", "SADDR", "DADDR", "DPORT"))
+b["conn_events"].open_perf_buffer(print_conn_event)
+print("\n%-6s %-12s %-4s %-5s %s" % ("PID", "COMM", "DIR", "FD", "BODY"))
+b["data_events"].open_perf_buffer(print_data_event)
+
+# Poll both perf buffers
 while True:
     try:
-        bpf.perf_buffer_poll()
+        b.perf_buffer_poll()
     except KeyboardInterrupt:
         exit()

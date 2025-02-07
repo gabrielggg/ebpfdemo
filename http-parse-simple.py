@@ -147,6 +147,8 @@ while 1:
   for i in range (payload_offset,len(packet_bytearray)-1):
     if (packet_bytearray[i]== 0x0A):
       if (packet_bytearray[i-1] == 0x0D):
-        break
+          if (packet_bytearray[i-2]== 0x0A):
+              if (packet_bytearray[i-3] == 0x0D):
+                    break
     print ("%c" % chr(packet_bytearray[i]), end = "")
   print("")

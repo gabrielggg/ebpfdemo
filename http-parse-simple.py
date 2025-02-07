@@ -41,7 +41,7 @@ def help():
     exit()
 
 #arguments
-interface="eth0"
+interface="enp0s3"
 
 if len(argv) == 2:
   if str(argv[1]) == '-h':

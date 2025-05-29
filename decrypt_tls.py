@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 #
-# decrypt_tls.py  Trace OpenSSL TLS read/write to dump plaintext
+# trace_tls_all.py   Trace all OpenSSL TLS read/write across all processes
 #
-# USAGE: sudo ./decrypt_tls.py <pid> [libssl_path]
+# USAGE: sudo ./trace_tls_all.py [libssl_path]
 #
-# Example: sudo ./decrypt_tls.py 1234 /usr/lib/x86_64-linux-gnu/libssl.so.1.1
+# Example: sudo ./trace_tls_all.py /usr/lib/x86_64-linux-gnu/libssl.so.1.1
 
-from bcc import BPF, USDT
+from bcc import BPF
 import ctypes as ct
 import sys
 
@@ -42,7 +42,7 @@ int probe_SSL_read_ret(struct pt_regs *ctx) {
     data.tid = bpf_get_current_pid_tgid();
     data.len = ret;
 
-    // SSL_read(buf) second argument is in RDX on x86_64
+    // SSL_read: buf pointer is in RDX on x86_64
     void *buf = (void *)PT_REGS_PARM2(ctx);
     bpf_probe_read_user(&data.buf, ret, buf);
 
@@ -83,42 +83,38 @@ class Data(ct.Structure):
         ("buf", ct.c_char * 4096),
     ]
 
+
 def print_event(cpu, data, size):
     event = ct.cast(data, ct.POINTER(Data)).contents
-    direction = "<" if print_event.is_read else ">"
+    # Direction: '<' for decrypted read, '>' for plaintext write
+    direction = '<' if print_event.is_read else '>'
     payload = event.buf[:event.len].decode('utf-8', errors='replace')
     print(f"{direction} pid={event.pid} tid={event.tid} len={event.len}")
     print(payload)
-    print("-" * 40)
+    print('-' * 40)
+
 
 # -----------------------------------------------------------------------------
 # main
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <pid> [libssl.so path]")
-        sys.exit(1)
-
-    target_pid = int(sys.argv[1])
-    lib_path = sys.argv[2] if len(sys.argv) >= 3 else "libssl.so"
+    lib_path = sys.argv[1] if len(sys.argv) > 1 else "libssl.so"
 
     # load BPF program
     b = BPF(text=bpf_text)
 
-    # SSL_read retprobe (decrypted data coming in)
+    # Attach to all processes: no pid filter
     b.attach_uprobe(name=lib_path, sym="SSL_read",
-                    fn_name="probe_SSL_read_ret",
-                    pid=target_pid, retprobe=True)
+                    fn_name="probe_SSL_read_ret", retprobe=True)
     print_event.is_read = True
-    b["events"].open_perf_buffer(print_event)
 
-    # SSL_write entry (plaintext about to go out)
     b.attach_uprobe(name=lib_path, sym="SSL_write",
-                    fn_name="probe_SSL_write_entry",
-                    pid=target_pid, retprobe=False)
+                    fn_name="probe_SSL_write_entry", retprobe=False)
     print_event.is_read = False
 
-    print(f"Tracing TLS plaintext on pid {target_pid} (hit Ctrl-C to end)")
+    b["events"].open_perf_buffer(print_event)
+
+    print(f"Tracing OpenSSL TLS plaintext globally via {lib_path} (Ctrl-C to exit)")
 
     try:
         while True:

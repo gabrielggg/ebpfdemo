@@ -1,9 +1,26 @@
 from bcc import BPF
 
 import ctypes
-
-# Define uint64_t as an unsigned long long
-uint64_t = ctypes.c_ulonglong
+ 
+# Must match the C “#define MAX_DATA_SIZE 4096”
+MAX_DATA_SIZE = 4096
+# Python-side definition of the C struct:
+class SSLDataEvent(ctypes.Structure):
+    _fields_ = [
+        # enum ssl_data_event_type is a 32-bit int
+        ("type",        ctypes.c_int),
+        # padding to align the next uint64 to an 8-byte boundary
+        ("_pad",        ctypes.c_int),
+        # the timestamp in nanoseconds (uint64_t)
+        ("timestamp_ns",ctypes.c_ulonglong),
+        # pid and tid (each uint32_t)
+        ("pid",         ctypes.c_uint),
+        ("tid",         ctypes.c_uint),
+        # the data buffer
+        ("data",        ctypes.c_char * MAX_DATA_SIZE),
+        # length of valid data
+        ("data_len",    ctypes.c_int),
+    ]
 
 # eBPF program in C
 bpf_text = """
@@ -191,11 +208,20 @@ b.attach_uretprobe(name="/usr/lib/x86_64-linux-gnu/libssl.so.3", sym="SSL_write"
 
 # Read the counts from the BPF map
 #elements = b.get_table("active_ssl_write_args_map")
+#def print_event(cpu, data, size):
+#    #event = b["tls_events"]
+#    event = b["tls_events"].event(data)
+#    #print(f"PID: {event.pid}, COMM: {event.comm.decode()}")
+#    print(event)
+
 def print_event(cpu, data, size):
-    #event = b["tls_events"]
-    event = b["tls_events"].event(data)
-    #print(f"PID: {event.pid}, COMM: {event.comm.decode()}")
-    print(event)
+    # cast the raw perf‐buffer blob into our Python struct
+    event = ctypes.cast(data, ctypes.POINTER(SSLDataEvent)).contents
+    # only print the part of the buffer that's valid
+    buf = bytes(event.data[:event.data_len])
+    print(f"[{event.timestamp_ns}] PID={event.pid} TID={event.tid} "
+          f"{'READ' if event.type==0 else 'WRITE'} len={event.data_len}\n"
+          f"    {buf!r}")
 
 b["tls_events"].open_perf_buffer(print_event)
 while True:

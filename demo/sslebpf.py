@@ -1,5 +1,10 @@
 from bcc import BPF
 
+import ctypes
+
+# Define uint64_t as an unsigned long long
+uint64_t = ctypes.c_ulonglong
+
 # eBPF program in C
 bpf_text = """
 /*
@@ -187,6 +192,7 @@ b.attach_uretprobe(name="/usr/lib/x86_64-linux-gnu/libssl.so.3", sym="SSL_write"
 # Read the counts from the BPF map
 #elements = b.get_table("active_ssl_write_args_map")
 def print_event(cpu, data, size):
+    #event = b["tls_events"]
     event = b["tls_events"].event(data)
     #print(f"PID: {event.pid}, COMM: {event.comm.decode()}")
     print(event)

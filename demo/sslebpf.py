@@ -1,5 +1,5 @@
 from bcc import BPF
-
+import sys
 import ctypes
  
 # Must match the C “#define MAX_DATA_SIZE 4096”
@@ -101,26 +101,36 @@ static __inline struct ssl_data_event_t* create_ssl_data_event(uint64_t current_
  * BPF syscall processing functions
  ***********************************************************/
 
-static int process_SSL_data(struct pt_regs* ctx, uint64_t id, enum ssl_data_event_type type,
-                            const char* buf) {
-  int len = (int)PT_REGS_RC(ctx);
-  if (len < 0) {
+ #define MAX_DATA_SIZE 4096
+ #define MAX_CHUNKS 16   // support up to 16×4096 = 64KiB per syscall
+
+ static int process_SSL_data(struct pt_regs* ctx,
+                             uint64_t id,
+                             enum ssl_data_event_type type,
+                             const char* buf) {
+    int total = (int)PT_REGS_RC(ctx);
+    if (total < 0) return 0;
+
+    #pragma unroll
+    for (int chunk_off = 0; chunk_off < total && chunk_off < MAX_CHUNKS*MAX_DATA_SIZE; 
+         chunk_off += MAX_DATA_SIZE) {
+      int this_len = total - chunk_off;
+      if (this_len > MAX_DATA_SIZE)
+        this_len = MAX_DATA_SIZE;
+
+      struct ssl_data_event_t* event = create_ssl_data_event(id);
+      if (!event) return 0;
+
+      event->type       = type;
+      event->data_len   = this_len;
+      // you may want to add an `offset` field to your struct so Python can reassemble
+      bpf_probe_read(event->data, this_len, buf + chunk_off);
+      tls_events.perf_submit(ctx, event, sizeof(*event));
+    }
+
     return 0;
-  }
+ }
 
-  struct ssl_data_event_t* event = create_ssl_data_event(id);
-  if (event == NULL) {
-    return 0;
-  }
-
-  event->type = type;
-  // This is a max function, but it is written in such a way to keep older BPF verifiers happy.
-  event->data_len = (len < MAX_DATA_SIZE ? (len & (MAX_DATA_SIZE - 1)) : MAX_DATA_SIZE);
-  bpf_probe_read(event->data, event->data_len, buf);
-  tls_events.perf_submit(ctx, event, sizeof(struct ssl_data_event_t));
-
-  return 0;
-}
 
 /***********************************************************
  * BPF probe function entry-points
@@ -214,16 +224,36 @@ b.attach_uretprobe(name="/usr/lib/x86_64-linux-gnu/libssl.so.3", sym="SSL_write"
 #    #print(f"PID: {event.pid}, COMM: {event.comm.decode()}")
 #    print(event)
 
-def print_event(cpu, data, size):
-    # cast the raw perf‐buffer blob into our Python struct
-    event = ctypes.cast(data, ctypes.POINTER(SSLDataEvent)).contents
-    # only print the part of the buffer that's valid
-    buf = bytes(event.data[:event.data_len])
-    print(f"[{event.timestamp_ns}] PID={event.pid} TID={event.tid} "
-          f"{'READ' if event.type==0 else 'WRITE'} len={event.data_len}\n"
-          f"    {buf!r}")
+#def print_event(cpu, data, size):
+#    # cast the raw perf‐buffer blob into our Python struct
+#    event = ctypes.cast(data, ctypes.POINTER(SSLDataEvent)).contents
+#    # only print the part of the buffer that's valid
+#    buf = bytes(event.data[:event.data_len])
+#    print(f"[{event.timestamp_ns}] PID={event.pid} TID={event.tid} "
+#          f"{'READ' if event.type==0 else 'WRITE'} len={event.data_len}\n"
+#          f"    {buf!r}")
 
-b["tls_events"].open_perf_buffer(print_event)
+def print_event(cpu, data, size):
+    event = ctypes.cast(data, ctypes.POINTER(SSLDataEvent)).contents
+    buf = bytes(event.data[:event.data_len])
+    print(
+        f"[{event.timestamp_ns}] PID={event.pid} TID={event.tid} "
+        f"{'READ' if event.type==0 else 'WRITE'} len={event.data_len}\n"
+        f"    {buf!r}"
+    )
+
+def lost_event(cpu, count):
+    # report how many we dropped
+    print(f"*** LOST {count} EVENTS on CPU {cpu} ***", file=sys.stderr)
+
+# bump to 64 pages instead of the default 8, and hook our lost-event handler
+b["tls_events"].open_perf_buffer(
+    print_event,
+    page_cnt=64,
+    lost_cb=lost_event
+)
+
+#b["tls_events"].open_perf_buffer(print_event)
 while True:
     b.perf_buffer_poll()
 #while 1:

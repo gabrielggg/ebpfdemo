@@ -40,7 +40,7 @@ struct ssl_data_event_t {
   int32_t data_len;
 };
 
-//BPF_PERF_OUTPUT(tls_events);
+BPF_PERF_OUTPUT(tls_events);
 
 /***********************************************************
  * Internal structs and definitions
@@ -53,11 +53,12 @@ BPF_HASH(active_ssl_write_args_map, uint64_t, const char*);
 
 // BPF programs are limited to a 512-byte stack. We store this value per CPU
 // and use it as a heap allocated value.
-//BPF_PERCPU_ARRAY(data_buffer_heap, struct ssl_data_event_t, 1);
+BPF_PERCPU_ARRAY(data_buffer_heap, struct ssl_data_event_t, 1);
 
 /***********************************************************
  * General helper functions
  ***********************************************************/
+
 
 static __inline struct ssl_data_event_t* create_ssl_data_event(uint64_t current_pid_tgid) {
   uint32_t kZero = 0;
@@ -109,11 +110,12 @@ int probe_entry_SSL_write(struct pt_regs* ctx) {
   uint64_t current_pid_tgid = bpf_get_current_pid_tgid();
   uint32_t pid = current_pid_tgid >> 32;
 
-  if (pid != TRACE_PID) {
+  //if (pid != TRACE_PID) {
     //return 0;
-  }
+  //}
 
   const char* buf = (const char*)PT_REGS_PARM2(ctx);
+  //bpf_probe_read(data, len, buf);
   active_ssl_write_args_map.update(&current_pid_tgid, &buf);
 
   return 0;
@@ -123,9 +125,9 @@ int probe_ret_SSL_write(struct pt_regs* ctx) {
   uint64_t current_pid_tgid = bpf_get_current_pid_tgid();
   uint32_t pid = current_pid_tgid >> 32;
 
-  if (pid != TRACE_PID) {
+  //if (pid != TRACE_PID) {
     //return 0;
-  }
+  //}
 
   const char** buf = active_ssl_write_args_map.lookup(&current_pid_tgid);
   if (buf != NULL) {
@@ -136,15 +138,18 @@ int probe_ret_SSL_write(struct pt_regs* ctx) {
   return 0;
 }
 
+
+
+
 // Function signature being probed:
 // int SSL_read(SSL *s, void *buf, int num)
 int probe_entry_SSL_read(struct pt_regs* ctx) {
   uint64_t current_pid_tgid = bpf_get_current_pid_tgid();
   uint32_t pid = current_pid_tgid >> 32;
 
-  if (pid != TRACE_PID) {
+  //if (pid != TRACE_PID) {
     //return 0;
-  }
+  //}
 
   const char* buf = (const char*)PT_REGS_PARM2(ctx);
 
@@ -156,9 +161,9 @@ int probe_ret_SSL_read(struct pt_regs* ctx) {
   uint64_t current_pid_tgid = bpf_get_current_pid_tgid();
   uint32_t pid = current_pid_tgid >> 32;
 
-  if (pid != TRACE_PID) {
+  //if (pid != TRACE_PID) {
     //return 0;
-  }
+  //}
 
   const char** buf = active_ssl_read_args_map.lookup(&current_pid_tgid);
   if (buf != NULL) {
@@ -168,6 +173,8 @@ int probe_ret_SSL_read(struct pt_regs* ctx) {
   active_ssl_read_args_map.delete(&current_pid_tgid);
   return 0;
 }
+
+
 """
 
 # Load the eBPF program
@@ -175,9 +182,19 @@ b = BPF(text=bpf_text)
 
 # Attach the uprobe to the 'main' function of /bin/ls
 b.attach_uprobe(name="/usr/lib/x86_64-linux-gnu/libssl.so.3", sym="SSL_write", fn_name="probe_entry_SSL_write")
+b.attach_uretprobe(name="/usr/lib/x86_64-linux-gnu/libssl.so.3", sym="SSL_write", fn_name="probe_ret_SSL_write")
 
 # Read the counts from the BPF map
-elements = b.get_table("active_ssl_write_args_map")
-while 1:
- for k, v in elements.items():
-    print(f"main called {v.value} times")
+#elements = b.get_table("active_ssl_write_args_map")
+def print_event(cpu, data, size):
+    event = b["tls_events"].event(data)
+    #print(f"PID: {event.pid}, COMM: {event.comm.decode()}")
+    print(event)
+
+b["tls_events"].open_perf_buffer(print_event)
+while True:
+    b.perf_buffer_poll()
+#while 1:
+# for k, v in elements.items():
+#    print(f"main called {v.value} times")
+#    print(elements.items())

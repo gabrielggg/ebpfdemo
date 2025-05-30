@@ -177,7 +177,7 @@ b = BPF(text=bpf_text)
 b.attach_uprobe(name="/usr/lib/x86_64-linux-gnu/libssl.so.3", sym="SSL_write", fn_name="probe_entry_SSL_write")
 
 # Read the counts from the BPF map
-counts = b.get_table("counts")
+elements = b.get_table("active_ssl_write_args_map")
 while 1:
- for k, v in counts.items():
+ for k, v in elements.items():
     print(f"main called {v.value} times")

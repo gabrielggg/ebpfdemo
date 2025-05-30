@@ -22,7 +22,7 @@ bpf_text = """
 
 #include <linux/ptrace.h>
 
-#include "openssl_tracer_types.h"
+//#include "openssl_tracer_types.h"
 
 
 #pragma once

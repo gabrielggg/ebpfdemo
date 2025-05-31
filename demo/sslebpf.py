@@ -18,6 +18,7 @@ class SSLDataEvent(ctypes.Structure):
         ("tid",         ctypes.c_uint),
         # the data buffer
         ("data",        ctypes.c_char * MAX_DATA_SIZE),
+        #("data",        ctypes.c_char * 8192),
         # length of valid data
         ("data_len",    ctypes.c_int),
     ]
@@ -104,6 +105,7 @@ static __inline struct ssl_data_event_t* create_ssl_data_event(uint64_t current_
 static int process_SSL_data(struct pt_regs* ctx, uint64_t id, enum ssl_data_event_type type,
                             const char* buf) {
   int len = (int)PT_REGS_RC(ctx);
+  //int len = 8192;
   if (len < 0) {
     return 0;
   }
@@ -117,8 +119,9 @@ static int process_SSL_data(struct pt_regs* ctx, uint64_t id, enum ssl_data_even
   // This is a max function, but it is written in such a way to keep older BPF verifiers happy.
   event->data_len = (len < MAX_DATA_SIZE ? (len & (MAX_DATA_SIZE - 1)) : MAX_DATA_SIZE);
   bpf_probe_read(event->data, event->data_len, buf);
+  //active_ssl_read_args_map.update(&id, event);
   tls_events.perf_submit(ctx, event, sizeof(struct ssl_data_event_t));
-
+  
   return 0;
 }
 
@@ -138,6 +141,9 @@ int probe_entry_SSL_write(struct pt_regs* ctx) {
 
   const char* buf = (const char*)PT_REGS_PARM2(ctx);
   //bpf_probe_read(data, len, buf);
+  //if (buf != NULL) {
+  //  process_SSL_data(ctx, current_pid_tgid, kSSLWrite, buf);
+  //}
   active_ssl_write_args_map.update(&current_pid_tgid, &buf);
 
   return 0;
@@ -198,6 +204,7 @@ int probe_ret_SSL_read(struct pt_regs* ctx) {
 
 
 """
+import time
 
 # Load the eBPF program
 b = BPF(text=bpf_text)
@@ -205,7 +212,8 @@ b = BPF(text=bpf_text)
 # Attach the uprobe to the 'main' function of /bin/ls
 b.attach_uprobe(name="/usr/lib/x86_64-linux-gnu/libssl.so.3", sym="SSL_write", fn_name="probe_entry_SSL_write")
 b.attach_uretprobe(name="/usr/lib/x86_64-linux-gnu/libssl.so.3", sym="SSL_write", fn_name="probe_ret_SSL_write")
-
+b.attach_uprobe(name="/usr/lib/x86_64-linux-gnu/libssl.so.3", sym="SSL_read", fn_name="probe_entry_SSL_read")
+b.attach_uretprobe(name="/usr/lib/x86_64-linux-gnu/libssl.so.3", sym="SSL_read", fn_name="probe_ret_SSL_read")
 # Read the counts from the BPF map
 #elements = b.get_table("active_ssl_write_args_map")
 #def print_event(cpu, data, size):
@@ -216,8 +224,10 @@ b.attach_uretprobe(name="/usr/lib/x86_64-linux-gnu/libssl.so.3", sym="SSL_write"
 
 def print_event(cpu, data, size):
     # cast the raw perf‐buffer blob into our Python struct
+    #print(size)
     event = ctypes.cast(data, ctypes.POINTER(SSLDataEvent)).contents
     # only print the part of the buffer that's valid
+    print(bytes(event))
     buf = bytes(event.data[:event.data_len])
     print(f"[{event.timestamp_ns}] PID={event.pid} TID={event.tid} "
           f"{'READ' if event.type==0 else 'WRITE'} len={event.data_len}\n"
@@ -225,7 +235,8 @@ def print_event(cpu, data, size):
 
 b["tls_events"].open_perf_buffer(print_event)
 while True:
-    b.perf_buffer_poll()
+   b.perf_buffer_poll()
+   #time.sleep(1)
 #while 1:
 # for k, v in elements.items():
 #    print(f"main called {v.value} times")

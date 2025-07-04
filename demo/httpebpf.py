@@ -188,12 +188,14 @@ BPF_HASH(recv_infotmp, u32, struct recv_info_t);
 
 int syscall__connect(struct pt_regs *ctx, int sockfd, const struct sockaddr *addr, int addrlen) {{
     u32 tgid = bpf_get_current_pid_tgid();
-    struct sockaddr_in addr_in = {{}};
+    struct sockaddr_in addr_in;
+    __builtin_memset(&addr_in, 0, sizeof(addr_in));
     bpf_probe_read_user(&addr_in, sizeof(addr_in), addr);
 
     // Check if address family is AF_INET
     if (addr_in.sin_family == AF_INET) {{
-        struct data_t data = {{}};
+        struct data_t data;
+        __builtin_memset(&data, 0, sizeof(data));
         data.tgid = tgid;
         data.fdf = sockfd;
         bpf_get_current_comm(&data.comm, sizeof(data.comm));
@@ -208,7 +210,8 @@ int syscall__connect(struct pt_regs *ctx, int sockfd, const struct sockaddr *add
 
 int syscall__close(struct pt_regs *ctx, int sockfd) {{
     u32 tgid = bpf_get_current_pid_tgid();
-    struct data_t data = {{}};
+    struct data_t data;
+    __builtin_memset(&data, 0, sizeof(data));
     data.tgid = tgid;
     data.fdf = sockfd;
     bpf_get_current_comm(&data.comm, sizeof(data.comm));
@@ -247,7 +250,8 @@ static inline int is_http_response(char *buf, int size) {{
 // SEND syscalls - capture outgoing data
 int syscall__sendto(struct pt_regs *ctx, int sockfd, void *buf, size_t len, int flags, struct sockaddr *dest_addr, int addrlen) {{
     u32 tgid = bpf_get_current_pid_tgid();
-    struct send_info_t info = {{}};
+    struct send_info_t info;
+    __builtin_memset(&info, 0, sizeof(info));
     
     if (bpf_get_current_comm(&info.comm, sizeof(info.comm)) == 0) {{
         info.tgid = tgid;
@@ -270,7 +274,8 @@ int syscall__sendto(struct pt_regs *ctx, int sockfd, void *buf, size_t len, int 
 
 int syscall__send(struct pt_regs *ctx, int sockfd, void *buf, size_t len, int flags) {{
     u32 tgid = bpf_get_current_pid_tgid();
-    struct send_info_t info = {{}};
+    struct send_info_t info;
+    __builtin_memset(&info, 0, sizeof(info));
     
     if (bpf_get_current_comm(&info.comm, sizeof(info.comm)) == 0) {{
         info.tgid = tgid;
@@ -293,7 +298,8 @@ int syscall__send(struct pt_regs *ctx, int sockfd, void *buf, size_t len, int fl
 
 int syscall__write(struct pt_regs *ctx, int fd, void *buf, size_t count) {{
     u32 tgid = bpf_get_current_pid_tgid();
-    struct send_info_t info = {{}};
+    struct send_info_t info;
+    __builtin_memset(&info, 0, sizeof(info));
     
     if (bpf_get_current_comm(&info.comm, sizeof(info.comm)) == 0) {{
         info.tgid = tgid;
@@ -317,7 +323,8 @@ int syscall__write(struct pt_regs *ctx, int fd, void *buf, size_t count) {{
 // RECV syscalls - capture incoming data
 int syscall__recvfrom(struct pt_regs *ctx, int sockfd, void *buf, size_t len, int flags, struct sockaddr *src_addr, int *addrlen) {{
     u32 tgid = bpf_get_current_pid_tgid();
-    struct recv_info_t info = {{}};
+    struct recv_info_t info;
+    __builtin_memset(&info, 0, sizeof(info));
     
     if (bpf_get_current_comm(&info.comm, sizeof(info.comm)) == 0) {{
         info.tgid = tgid;
@@ -333,7 +340,8 @@ int syscall__recvfrom(struct pt_regs *ctx, int sockfd, void *buf, size_t len, in
 
 int syscall__recv(struct pt_regs *ctx, int sockfd, void *buf, size_t len, int flags) {{
     u32 tgid = bpf_get_current_pid_tgid();
-    struct recv_info_t info = {{}};
+    struct recv_info_t info;
+    __builtin_memset(&info, 0, sizeof(info));
     
     if (bpf_get_current_comm(&info.comm, sizeof(info.comm)) == 0) {{
         info.tgid = tgid;
@@ -349,7 +357,8 @@ int syscall__recv(struct pt_regs *ctx, int sockfd, void *buf, size_t len, int fl
 
 int syscall__read(struct pt_regs *ctx, int fd, void *buf, size_t count) {{
     u32 tgid = bpf_get_current_pid_tgid();
-    struct recv_info_t info = {{}};
+    struct recv_info_t info;
+    __builtin_memset(&info, 0, sizeof(info));
     
     if (bpf_get_current_comm(&info.comm, sizeof(info.comm)) == 0) {{
         info.tgid = tgid;
@@ -366,7 +375,8 @@ int syscall__read(struct pt_regs *ctx, int fd, void *buf, size_t count) {{
 // Return probe for send syscalls
 int trace_send_return(struct pt_regs *ctx) {{
     u32 tgid = bpf_get_current_pid_tgid();
-    struct data_t data = {{}};
+    struct data_t data;
+    __builtin_memset(&data, 0, sizeof(data));
     struct send_info_t *infop;
 
     // Lookup the entry for our send
@@ -407,7 +417,8 @@ int trace_send_return(struct pt_regs *ctx) {{
 // Return probe for recv syscalls
 int trace_recv_return(struct pt_regs *ctx) {{
     u32 tgid = bpf_get_current_pid_tgid();
-    struct data_t data = {{}};
+    struct data_t data;
+    __builtin_memset(&data, 0, sizeof(data));
     struct recv_info_t *infop;
 
     // Lookup the entry for our recv

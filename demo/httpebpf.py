@@ -2,13 +2,10 @@ from bcc import BPF
 import socket
 import struct
 
-# eBPF C program
 bpf_program = """
 #include <uapi/linux/ptrace.h>
-#include <linux/tcp.h>
 #include <linux/net.h>
-#include <linux/skbuff.h>
-#include <net/sock.h>
+#include <linux/in.h>
 
 struct data_t {
     u32 pid;
@@ -19,35 +16,27 @@ struct data_t {
 };
 BPF_PERF_OUTPUT(events);
 
-int kprobe__tcp_recvmsg(struct pt_regs *ctx, struct sock *sk, struct msghdr *msg, size_t len, int flags, int addr_len) {
-    u16 dport = 0;
-    bpf_probe_read_kernel(&dport, sizeof(dport), ((char *)sk) + offsetof(struct inet_sock, inet_dport));
-    dport = ntohs(dport);
-
-    // Filter port 80 (HTTP)
-    if (dport != 80) {
+int kretprobe__sys_recvfrom(struct pt_regs *ctx) {
+    int ret = PT_REGS_RC(ctx);
+    if (ret <= 0) {
         return 0;
     }
 
     struct data_t data = {};
     data.pid = bpf_get_current_pid_tgid() >> 32;
     data.ts = bpf_ktime_get_ns();
-    data.len = len;
+    data.len = ret;
     bpf_get_current_comm(&data.comm, sizeof(data.comm));
 
-    // Read iov_base pointer from msghdr
-    struct iovec iov;
-    bpf_probe_read_kernel(&iov, sizeof(iov), (void *)msg->msg_iter.iov);
-
-    size_t bytes_to_read = len;
+    // Retrieve arguments of sys_recvfrom
+    void *buf = (void *)PT_REGS_PARM2(ctx);
+    size_t bytes_to_read = ret;
     if (bytes_to_read > sizeof(data.buf)) {
         bytes_to_read = sizeof(data.buf);
     }
-
-    bpf_probe_read_kernel(&data.buf, bytes_to_read, iov.iov_base);
+    bpf_probe_read_user(&data.buf, bytes_to_read, buf);
 
     events.perf_submit(ctx, &data, sizeof(data));
-
     return 0;
 }
 """
@@ -60,7 +49,7 @@ def print_event(cpu, data, size):
     print("Payload:")
     print(event.buf[:event.len].decode(errors="replace"))
 
-print("Attaching kprobe to tcp_recvmsg... (Ctrl-C to stop)")
+print("Attaching kretprobe to sys_recvfrom... (Ctrl-C to stop)")
 
 b["events"].open_perf_buffer(print_event)
 
@@ -69,4 +58,3 @@ try:
         b.perf_buffer_poll()
 except KeyboardInterrupt:
     print("Detaching...")
-

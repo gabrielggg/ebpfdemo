@@ -16,6 +16,7 @@ bpf_program = """
 #include <linux/ip.h>
 #include <linux/skbuff.h>
 #include <linux/netdevice.h>
+#include <linux/uio.h>
 
 #define MAX_PAYLOAD_SIZE 1024
 #define HTTP_PORT 80
@@ -36,6 +37,9 @@ struct http_data_t {
 
 // Map to store HTTP data
 BPF_PERF_OUTPUT(http_events);
+
+// Map to store data for retrieval in kretprobe
+BPF_HASH(recv_args, u32, struct msghdr*);
 
 // Helper function to check if data contains HTTP
 static inline int is_http_data(const char* data, u32 len) {
@@ -60,7 +64,29 @@ static inline int is_http_data(const char* data, u32 len) {
     return 0;
 }
 
-// Kprobe for tcp_sendmsg (outbound traffic)
+// Helper function to extract data from iov_iter
+static inline int extract_iov_data(struct iov_iter *iter, char *buffer, u32 max_len) {
+    // Try to read from the iterator based on its type
+    if (iter->type & ITER_IOVEC) {
+        // For IOVEC type, try to access the iov structure
+        struct iovec iov;
+        if (bpf_probe_read_kernel(&iov, sizeof(iov), iter->iov) != 0) {
+            return 0;
+        }
+        
+        u32 len = iov.iov_len;
+        if (len > max_len) len = max_len;
+        
+        if (bpf_probe_read_user(buffer, len, iov.iov_base) != 0) {
+            return 0;
+        }
+        return len;
+    }
+    
+    return 0;
+}
+
+// Alternative approach using socket buffer
 int kprobe__tcp_sendmsg(struct pt_regs *ctx, struct sock *sk, struct msghdr *msg, size_t size) {
     if (size == 0) return 0;
     
@@ -74,18 +100,15 @@ int kprobe__tcp_sendmsg(struct pt_regs *ctx, struct sock *sk, struct msghdr *msg
         return 0;
     }
     
-    // Get the first iov buffer
-    struct iovec *iov = msg->msg_iter.iov;
-    if (!iov) return 0;
+    // Extract data from iov_iter
+    char data_buffer[MAX_PAYLOAD_SIZE];
+    u32 len = extract_iov_data(&msg->msg_iter, data_buffer, MAX_PAYLOAD_SIZE);
     
-    char *data = (char *)iov->iov_base;
-    u32 len = iov->iov_len;
-    
+    if (len == 0) return 0;
     if (len > size) len = size;
-    if (len > MAX_PAYLOAD_SIZE) len = MAX_PAYLOAD_SIZE;
     
     // Check if this is HTTP data
-    if (!is_http_data(data, len)) return 0;
+    if (!is_http_data(data_buffer, len)) return 0;
     
     struct http_data_t http_data = {};
     http_data.pid = bpf_get_current_pid_tgid() >> 32;
@@ -98,16 +121,16 @@ int kprobe__tcp_sendmsg(struct pt_regs *ctx, struct sock *sk, struct msghdr *msg
     http_data.direction = 1; // outbound
     
     // Copy payload data
-    if (bpf_probe_read_user(http_data.payload, len, data) != 0) {
-        return 0;
-    }
+    __builtin_memcpy(http_data.payload, data_buffer, len);
     
     http_events.perf_submit(ctx, &http_data, sizeof(http_data));
     return 0;
 }
 
-// Kprobe for tcp_recvmsg (inbound traffic)
+// Store arguments for kretprobe
 int kprobe__tcp_recvmsg(struct pt_regs *ctx, struct sock *sk, struct msghdr *msg, size_t len, int nonblock, int flags, int *addr_len) {
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    recv_args.update(&pid, &msg);
     return 0;
 }
 
@@ -116,9 +139,14 @@ int kretprobe__tcp_recvmsg(struct pt_regs *ctx) {
     int ret = PT_REGS_RC(ctx);
     if (ret <= 0) return 0;
     
-    struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
-    struct msghdr *msg = (struct msghdr *)PT_REGS_PARM2(ctx);
+    u32 pid = bpf_get_current_pid_tgid() >> 32;
+    struct msghdr **msg_ptr = recv_args.lookup(&pid);
+    if (!msg_ptr) return 0;
     
+    struct msghdr *msg = *msg_ptr;
+    recv_args.delete(&pid);
+    
+    struct sock *sk = (struct sock *)PT_REGS_PARM1(ctx);
     struct inet_sock *inet = (struct inet_sock *)sk;
     u16 sport = bpf_ntohs(inet->inet_sport);
     u16 dport = bpf_ntohs(inet->inet_dport);
@@ -129,20 +157,18 @@ int kretprobe__tcp_recvmsg(struct pt_regs *ctx) {
         return 0;
     }
     
-    // Get the first iov buffer
-    struct iovec *iov = msg->msg_iter.iov;
-    if (!iov) return 0;
+    // Extract data from iov_iter
+    char data_buffer[MAX_PAYLOAD_SIZE];
+    u32 len = extract_iov_data(&msg->msg_iter, data_buffer, MAX_PAYLOAD_SIZE);
     
-    char *data = (char *)iov->iov_base;
-    u32 len = ret;
-    
-    if (len > MAX_PAYLOAD_SIZE) len = MAX_PAYLOAD_SIZE;
+    if (len == 0) return 0;
+    if (len > ret) len = ret;
     
     // Check if this is HTTP data
-    if (!is_http_data(data, len)) return 0;
+    if (!is_http_data(data_buffer, len)) return 0;
     
     struct http_data_t http_data = {};
-    http_data.pid = bpf_get_current_pid_tgid() >> 32;
+    http_data.pid = pid;
     http_data.uid = bpf_get_current_uid_gid() & 0xffffffff;
     http_data.saddr = inet->inet_saddr;
     http_data.daddr = inet->inet_daddr;
@@ -152,9 +178,57 @@ int kretprobe__tcp_recvmsg(struct pt_regs *ctx) {
     http_data.direction = 0; // inbound
     
     // Copy payload data
-    if (bpf_probe_read_user(http_data.payload, len, data) != 0) {
-        return 0;
-    }
+    __builtin_memcpy(http_data.payload, data_buffer, len);
+    
+    http_events.perf_submit(ctx, &http_data, sizeof(http_data));
+    return 0;
+}
+
+// Alternative approach using socket write/read syscalls
+int kprobe__sys_write(struct pt_regs *ctx, int fd, const char __user *buf, size_t count) {
+    if (count == 0 || count > MAX_PAYLOAD_SIZE) return 0;
+    
+    char data[MAX_PAYLOAD_SIZE];
+    if (bpf_probe_read_user(data, count, buf) != 0) return 0;
+    
+    // Check if this looks like HTTP data
+    if (!is_http_data(data, count)) return 0;
+    
+    struct http_data_t http_data = {};
+    http_data.pid = bpf_get_current_pid_tgid() >> 32;
+    http_data.uid = bpf_get_current_uid_gid() & 0xffffffff;
+    http_data.payload_len = count;
+    http_data.direction = 1; // outbound
+    
+    __builtin_memcpy(http_data.payload, data, count);
+    
+    http_events.perf_submit(ctx, &http_data, sizeof(http_data));
+    return 0;
+}
+
+int kprobe__sys_read(struct pt_regs *ctx, int fd, char __user *buf, size_t count) {
+    return 0;
+}
+
+int kretprobe__sys_read(struct pt_regs *ctx) {
+    int ret = PT_REGS_RC(ctx);
+    if (ret <= 0 || ret > MAX_PAYLOAD_SIZE) return 0;
+    
+    char __user *buf = (char __user *)PT_REGS_PARM2(ctx);
+    char data[MAX_PAYLOAD_SIZE];
+    
+    if (bpf_probe_read_user(data, ret, buf) != 0) return 0;
+    
+    // Check if this looks like HTTP data
+    if (!is_http_data(data, ret)) return 0;
+    
+    struct http_data_t http_data = {};
+    http_data.pid = bpf_get_current_pid_tgid() >> 32;
+    http_data.uid = bpf_get_current_uid_gid() & 0xffffffff;
+    http_data.payload_len = ret;
+    http_data.direction = 0; // inbound
+    
+    __builtin_memcpy(http_data.payload, data, ret);
     
     http_events.perf_submit(ctx, &http_data, sizeof(http_data));
     return 0;

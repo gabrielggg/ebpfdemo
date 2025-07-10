@@ -72,7 +72,7 @@ struct send_info_t {
 };
 
 BPF_HASH(infotmp, u32, struct send_info_t );
-BPF_HASH(infotmp2, u32, const char*);
+//BPF_HASH(infotmp2, u32, const char*);
 
 
 
@@ -94,9 +94,11 @@ int syscall__sendto(struct pt_regs *ctx, int sockfd, void *buf, size_t len, int 
         //bpf_probe_read(&info.comm, 256, &buf);
         // Update temporary data map
         const char* buf2 = (const char*)buf;
+        //info.data = &buf2;
+        bpf_probe_read(&info.data, 256, &buf2);
         infotmp.update(&tgid, &info);
 
-        infotmp2.update(&tgid, &buf2);
+        //infotmp2.update(&tgid, &buf2);
 
 
     return 0;
@@ -111,22 +113,22 @@ int trace_return(struct pt_regs *ctx)
 
     // Lookup the entry for our sendto
     infop = infotmp.lookup(&tgid);
-    const char** infop2 = infotmp2.lookup(&tgid);
+    //const char** infop2 = infotmp2.lookup(&tgid);
     if (infop == 0) {
         // missed entry
         return 0;
     }
-    if (infop2 == NULL) {
+    //if (infop2 == NULL) {
      //process_SSL_data(ctx, current_pid_tgid, kSSLWrite, *buf);
-       return 0;
-    }
+    //   return 0;
+    //}
 
-
+    const char** infop3 = infop->data;
     // Set Thread ID
     data.tgid = infop->tgid;
     // Set Socket File Descriptor
     data.fdf = infop->fdf;
-    bpf_probe_read(&data.data, 256, *infop2);
+    bpf_probe_read(&data.data, 256, *infop3);
     bpf_probe_read_kernel(&data.comm, 16, infop->comm);
     // Assign the amount of data sent to the ret field, as obtained from the register context
     data.ret = PT_REGS_RC(ctx);
@@ -135,7 +137,7 @@ int trace_return(struct pt_regs *ctx)
     tls_events.perf_submit(ctx, &data, sizeof(data));
     // Delete temporary entry
     infotmp.delete(&tgid);
-    infotmp2.delete(&tgid);
+    //infotmp2.delete(&tgid);
     return 0;
 }
 
@@ -172,7 +174,7 @@ def print_event(cpu, data, size):
     print(f"The process: {e.comm} produced the data: {e.data} with pid-{e.tgid} sent {e.ret} bytes through socket FD: {e.fdf}")
     # only print the part of the buffer that's valid
     #print(bytes(event))
-    #print(bytes(e))
+    print(bytes(e))
     #print(f"[{event.timestamp_ns}] PID={event.pid} TID={event.tid} "
     #      f"{'READ' if event.type==0 else 'WRITE'} len={event.data_len}\n"
     #      f"    {buf!r}")

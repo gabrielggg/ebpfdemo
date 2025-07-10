@@ -6,33 +6,10 @@ MAX_DATA_SIZE = 4096
 
 #TASK_COMM_LEN = 16
 SOCKETS = {}
-# Python-side definition of the C struct:
-#class SSLDataEvent(ct.Structure):
-#    _fields_ = [
-#        # enum ssl_data_event_type is a 32-bit int
-#        ("type",        ctypes.c_int),
-#        # padding to align the next uint64 to an 8-byte boundary
-#        ("_pad",        ctypes.c_int),
-#        # the timestamp in nanoseconds (uint64_t)
-#        ("timestamp_ns",ctypes.c_ulonglong),
-#        # pid and tid (each uint32_t)
-#        ("pid",         ctypes.c_uint),
-#        ("tid",         ctypes.c_uint),
-#        # the data buffer
-#        ("data",        ctypes.c_char * MAX_DATA_SIZE),
-#        #("data",        ctypes.c_char * 8192),
-#        # length of valid data
-#        ("data_len",    ctypes.c_int),
-#    ]
 
-# eBPF program in C
 bpf_text = """
 
-
-
 #include <linux/ptrace.h>
-
-
 
 enum event_type {
     CONNECTED,
@@ -74,11 +51,11 @@ BPF_HASH(active_ssl_write_args_map, uint64_t, const char*);
 struct data_t {
     u32 tgid;                // Thread ID
     int fdf;                 // Socket File Descriptor
-    char comm[256];// The current process name
+    char data[256];// The current process name
     u32 ip_addr;             // IP Address
     int ret;                 // Return Value
     enum event_type type;    // Event Type
-  //  char data[256];
+    char comm[16];
 };
 
 /***********************************************************
@@ -90,8 +67,8 @@ struct data_t {
 struct send_info_t {
     u32 tgid;
     int fdf;
-    char comm[256];
-//    char data[256];
+    char data[256];
+    char comm[16];
 };
 
 BPF_HASH(infotmp, u32, struct send_info_t );
@@ -107,7 +84,7 @@ int syscall__sendto(struct pt_regs *ctx, int sockfd, void *buf, size_t len, int 
     struct send_info_t info = {};
     //const char* buf2 = (const char*)PT_REGS_PARM2(ctx);
 
-
+        bpf_get_current_comm(&info.comm, sizeof(info.comm));
         // Set Thread ID
         info.tgid = tgid;
         // Set Socket File Descriptor
@@ -149,8 +126,8 @@ int trace_return(struct pt_regs *ctx)
     data.tgid = infop->tgid;
     // Set Socket File Descriptor
     data.fdf = infop->fdf;
-    bpf_probe_read(&data.comm, 256, *infop2);
-    //bpf_probe_read(&data.data, 256, &infop->data);
+    bpf_probe_read(&data.data, 256, *infop2);
+    bpf_probe_read_kernel(&data.comm, 16, infop->comm);
     // Assign the amount of data sent to the ret field, as obtained from the register context
     data.ret = PT_REGS_RC(ctx);
     data.type = DATA_SENT;
@@ -181,21 +158,21 @@ class SocketInfo(ct.Structure):
     _fields_ = [
         ("tgid", ct.c_uint32),
         ("fdf", ct.c_int),
-        ("comm", ct.c_char * 256),
+        ("data", ct.c_char * 256),
         ("ip_addr", ct.c_uint32),
         ("ret", ct.c_int),
         ("type", ct.c_uint),
-        #("data", ct.c_char * 256),
+        ("comm", ct.c_char * 16),
     ]
 
 def print_event(cpu, data, size):
     # cast the raw perf‐buffer blob into our Python struct
     #print(size)
     e = ct.cast(data, ct.POINTER(SocketInfo)).contents
-    print(f"The comm: {e.comm}-{e.tgid} sent {e.ret} bytes through socket FD: {e.fdf}")
+    print(f"The process: {e.comm} produced the data: {e.data} with pid-{e.tgid} sent {e.ret} bytes through socket FD: {e.fdf}")
     # only print the part of the buffer that's valid
     #print(bytes(event))
-    print(bytes(e))
+    #print(bytes(e))
     #print(f"[{event.timestamp_ns}] PID={event.pid} TID={event.tid} "
     #      f"{'READ' if event.type==0 else 'WRITE'} len={event.data_len}\n"
     #      f"    {buf!r}")

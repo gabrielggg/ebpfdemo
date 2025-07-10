@@ -1,78 +1,186 @@
-#!/usr/bin/python
-#
-
-
-from __future__ import print_function
 from bcc import BPF
-from sys import argv
 
-import sys
-import socket
-import os
+import ctypes as ct
+# Must match the C “#define MAX_DATA_SIZE 4096”
+MAX_DATA_SIZE = 4096
 
-interface="eth0"
+TASK_COMM_LEN = 16
+SOCKETS = {}
+# Python-side definition of the C struct:
+#class SSLDataEvent(ct.Structure):
+#    _fields_ = [
+#        # enum ssl_data_event_type is a 32-bit int
+#        ("type",        ctypes.c_int),
+#        # padding to align the next uint64 to an 8-byte boundary
+#        ("_pad",        ctypes.c_int),
+#        # the timestamp in nanoseconds (uint64_t)
+#        ("timestamp_ns",ctypes.c_ulonglong),
+#        # pid and tid (each uint32_t)
+#        ("pid",         ctypes.c_uint),
+#        ("tid",         ctypes.c_uint),
+#        # the data buffer
+#        ("data",        ctypes.c_char * MAX_DATA_SIZE),
+#        #("data",        ctypes.c_char * 8192),
+#        # length of valid data
+#        ("data_len",    ctypes.c_int),
+#    ]
 
-print ("binding socket to '%s'" % interface)
+# eBPF program in C
+bpf_text = """
 
-bpf_text="""
-#include <uapi/linux/ptrace.h>
-#include <net/sock.h>
-#include <bcc/proto.h>
 
-#define IP_TCP  6
-#define ETH_HLEN 14
 
-int http_filter(struct __sk_buff *skb) {
+#include <linux/ptrace.h>
 
-        u8 *cursor = 0;
 
-        struct ethernet_t *ethernet = cursor_advance(cursor, sizeof(*ethernet));
-        //filter IP packets (ethernet type = 0x0800)
-        if (!(ethernet->type == 0x0800)) {
-                goto DROP;
-        }
 
-        struct ip_t *ip = cursor_advance(cursor, sizeof(*ip));
-        //filter TCP packets (ip next protocol = 0x06)
-        if (ip->nextp != IP_TCP) {
-                goto DROP;
-        }
+enum event_type {
+    CONNECTED,
+    DATA_SENT,
+    CLOSED,
+};
+#pragma once
 
-        goto KEEP;
+#define MAX_DATA_SIZE 4096
 
-        //keep the packet and send it to userspace returning -1
-        KEEP:
-        return -1;
 
-        //drop the packet returning 0
-        DROP:
-        return 0;
+BPF_PERF_OUTPUT(tls_events);
 
+/***********************************************************
+ * Internal structs and definitions
+ ***********************************************************/
+
+// Key is thread ID (from bpf_get_current_pid_tgid).
+// Value is a pointer to the data buffer argument to SSL_write/SSL_read.
+BPF_HASH(active_ssl_read_args_map, uint64_t, const char*);
+BPF_HASH(active_ssl_write_args_map, uint64_t, const char*);
+
+// BPF programs are limited to a 512-byte stack. We store this value per CPU
+// and use it as a heap allocated value.
+//BPF_PERCPU_ARRAY(data_buffer_heap, struct ssl_data_event_t, 1);
+
+/***********************************************************
+ * General helper functions
+ ***********************************************************/
+
+
+
+/***********************************************************
+ * BPF syscall processing functions
+ ***********************************************************/
+
+
+
+struct data_t {
+    u32 tgid;                // Thread ID
+    int fdf;                 // Socket File Descriptor
+    char comm[TASK_COMM_LEN];// The current process name
+    u32 ip_addr;             // IP Address
+    int ret;                 // Return Value
+    enum event_type type;    // Event Type
+//    char data[MAX_DATA_SIZE];
+};
+
+/***********************************************************
+ * BPF probe function entry-points
+ ***********************************************************/
+//BPF_HASH(infotmp, u32, struct send_info_t );
+
+
+struct send_info_t {
+    u32 tgid;
+    int fdf;
+    char comm[TASK_COMM_LEN];
+ //   char data[MAX_DATA_SIZE];
+};
+
+BPF_HASH(infotmp, u32, struct send_info_t );
+
+
+
+
+
+int syscall__sendto(struct pt_regs *ctx, int sockfd, void *buf, size_t len, int flags, struct sockaddr *dest_addr, int addrlen) {
+    u32 tgid = bpf_get_current_pid_tgid();
+    struct send_info_t info = {};
+    if (bpf_get_current_comm(&info.comm, sizeof(info.comm)) == 0) {
+        // Set Thread ID
+        info.tgid = tgid;
+        // Set Socket File Descriptor
+        info.fdf = sockfd;
+        // Update temporary data map
+        infotmp.update(&tgid, &info);
+    }
+
+    return 0;
 }
+
+int trace_return(struct pt_regs *ctx)
+{
+    u32 tgid = bpf_get_current_pid_tgid();
+
+    struct data_t data = {};
+    struct send_info_t *infop;
+
+    // Lookup the entry for our sendto
+    infop = infotmp.lookup(&tgid);
+    if (infop == 0) {
+        // missed entry
+        return 0;
+    }
+
+    // Set Thread ID
+    data.tgid = infop->tgid;
+    // Set Socket File Descriptor
+    data.fdf = infop->fdf;
+    bpf_probe_read_kernel(&data.comm, sizeof(data.comm), infop->comm);
+    // Assign the amount of data sent to the ret field, as obtained from the register context
+    data.ret = PT_REGS_RC(ctx);
+    data.type = DATA_SENT;
+    // Submit data to user space
+    tls_events.perf_submit(ctx, &data, sizeof(data));
+    // Delete temporary entry
+    infotmp.delete(&tgid);
+    return 0;
+}
+
 """
+import time
 
-bpf = BPF(text=bpf_text, debug = 0)
+# Load the eBPF program
+b = BPF(text=bpf_text)
 
-function_http_filter = bpf.load_func("http_filter", BPF.SOCKET_FILTER)
+# Attach the uprobe to the 'main' function of /bin/ls
+#b.attach_kprobe(event=b.get_syscall_fnname("sendto"), fn_name="probe_entry_write")
+#b.attach_kretprobe(event=b.get_syscall_fnname("sendto"), fn_name="probe_ret_write")
+sendto_e = b.get_syscall_fnname("sendto").decode()
+b.attach_kprobe(event=sendto_e, fn_name="syscall__sendto")
+b.attach_kretprobe(event=sendto_e, fn_name="trace_return")
+#b.attach_kprobe(event=b.get_syscall_fnname("recvfrom"), fn_name="probe_entry_SSL_read")
+#b.attach_kretprobe(event=b.get_syscall_fnname("recvfrom"), fn_name="probe_ret_SSL_read")
 
-#create raw socket, bind it to interface
-#attach bpf program to socket created
-BPF.attach_raw_socket(function_http_filter, interface)
+class SocketInfo(ct.Structure):
+    _fields_ = [
+        ("tgid", ct.c_uint32),
+        ("fdf", ct.c_int),
+        ("comm", ct.c_char * TASK_COMM_LEN),
+        ("ip_addr", ct.c_uint32),
+        ("ret", ct.c_int),
+        ("type", ct.c_uint),
+    ]
 
-#get file descriptor of the socket previously created inside BPF.attach_raw_socket
-socket_fd = function_http_filter.sock
-
-#create python socket object, from the file descriptor
-sock = socket.fromfd(socket_fd,socket.PF_PACKET,socket.SOCK_RAW,socket.IPPROTO_IP)
-#set it as blocking socket
-sock.setblocking(True)
-
-while 1:
-  #retrieve raw packet from socket
-  packet_str = os.read(socket_fd,2048)
-
-  #convert packet into bytearray
-  packet_bytearray = bytearray(packet_str) 
-  print(packet_bytearray)
-
-  print("")
+def print_event(cpu, data, size):
+    # cast the raw perf‐buffer blob into our Python struct
+    #print(size)
+    e = ct.cast(data, ct.POINTER(SocketInfo)).contents
+    print(f"The comm: {e.comm.decode()}-{e.tgid} sent {e.ret} bytes through socket FD: {e.fdf}")
+    # only print the part of the buffer that's valid
+    #print(bytes(event))
+    #buf = bytes(event.data[:event.data_len])
+    #print(f"[{event.timestamp_ns}] PID={event.pid} TID={event.tid} "
+    #      f"{'READ' if event.type==0 else 'WRITE'} len={event.data_len}\n"
+    #      f"    {buf!r}")
+    #print(bytes(event))
+b["tls_events"].open_perf_buffer(print_event)
+while True:
+   b.perf_buffer_poll()

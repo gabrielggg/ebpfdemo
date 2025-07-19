@@ -27,25 +27,9 @@ BPF_PERF_OUTPUT(tls_events);
  * Internal structs and definitions
  ***********************************************************/
 
-// Key is thread ID (from bpf_get_current_pid_tgid).
-// Value is a pointer to the data buffer argument to SSL_write/SSL_read.
+
 BPF_HASH(active_ssl_read_args_map, uint64_t, const char*);
 BPF_HASH(active_ssl_write_args_map, uint64_t, const char*);
-
-// BPF programs are limited to a 512-byte stack. We store this value per CPU
-// and use it as a heap allocated value.
-//BPF_PERCPU_ARRAY(data_buffer_heap, struct ssl_data_event_t, 1);
-
-/***********************************************************
- * General helper functions
- ***********************************************************/
-
-
-
-/***********************************************************
- * BPF syscall processing functions
- ***********************************************************/
-
 
 
 struct data_t {
@@ -58,12 +42,6 @@ struct data_t {
     char comm[16];
 };
 
-/***********************************************************
- * BPF probe function entry-points
- ***********************************************************/
-//BPF_HASH(infotmp, u32, struct send_info_t );
-
-
 struct send_info_t {
     u32 tgid;
     int fdf;
@@ -72,33 +50,20 @@ struct send_info_t {
 };
 
 BPF_HASH(infotmp, u32, struct send_info_t );
-//BPF_HASH(infotmp2, u32, const char*);
-
-
-
-
-
 
 int syscall__sendto(struct pt_regs *ctx, int sockfd, void *buf, size_t len, int flags, struct sockaddr *dest_addr, int addrlen) {
     u32 tgid = bpf_get_current_pid_tgid();
     struct send_info_t info = {};
-    //const char* buf2 = (const char*)PT_REGS_PARM2(ctx);
+
 
         bpf_get_current_comm(&info.comm, sizeof(info.comm));
         // Set Thread ID
         info.tgid = tgid;
         // Set Socket File Descriptor
         info.fdf = sockfd;
-        //const char* buf2 = (const char*)PT_REGS_PARM2(ctx);
-        //info.data = &buf2
-        //bpf_probe_read(&info.comm, 256, &buf);
-        // Update temporary data map
         const char* buf2 = (const char*)buf;
-        //info.data = &buf2;
         bpf_probe_read(&info.data, 256, &buf2);
         infotmp.update(&tgid, &info);
-
-        //infotmp2.update(&tgid, &buf2);
 
 
     return 0;
@@ -118,10 +83,7 @@ int trace_return(struct pt_regs *ctx)
         // missed entry
         return 0;
     }
-    //if (infop2 == NULL) {
-     //process_SSL_data(ctx, current_pid_tgid, kSSLWrite, *buf);
-    //   return 0;
-    //}
+
 
     const char** infop3 = infop->data;
     // Set Thread ID

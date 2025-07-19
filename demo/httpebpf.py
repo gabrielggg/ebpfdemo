@@ -35,7 +35,7 @@ BPF_HASH(active_ssl_write_args_map, uint64_t, const char*);
 struct data_t {
     u32 tgid;                // Thread ID
     int fdf;                 // Socket File Descriptor
-    char data[256];// The current process name
+    char data[256];
     u32 ip_addr;             // IP Address
     int ret;                 // Return Value
     enum event_type type;    // Event Type
